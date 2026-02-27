@@ -40,6 +40,9 @@ pub fn run(file_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
+    let section_parts: Vec<Vec<SectionPart>> =
+        sections.iter().map(|s| split_section_by_mermaid(s)).collect();
+
     let file_path_clone = file_path.clone();
     eframe::run_native(
         "mdr",
@@ -48,6 +51,7 @@ pub fn run(file_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             Ok(Box::new(MdrApp {
                 markdown,
                 sections,
+                section_parts,
                 has_preamble,
                 caches: Vec::new(),
                 file_path: file_path_clone,
@@ -59,6 +63,8 @@ pub fn run(file_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
                 search_query: String::new(),
                 search_section_matches: Vec::new(),
                 current_match: 0,
+                texture_cache: std::collections::HashMap::new(),
+                popup_texture: None,
             }))
         }),
     )
@@ -99,9 +105,96 @@ fn split_by_headings(markdown: &str) -> (bool, Vec<String>) {
     (has_preamble, sections)
 }
 
+enum SectionPart {
+    Markdown(String),
+    MermaidImage { base64_data: String },
+}
+
+/// Split a section's markdown text by mermaid diagram images.
+/// Mermaid images produced by `preprocess_mermaid_for_egui` have the form:
+/// `![mermaid diagram](data:image/png;base64,...)`
+/// Each such image becomes a `MermaidImage` part; surrounding text becomes `Markdown` parts.
+fn split_section_by_mermaid(section: &str) -> Vec<SectionPart> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"!\[mermaid diagram\]\(data:image/png;base64,([A-Za-z0-9+/=]+)\)",
+        )
+        .unwrap()
+    });
+
+    let mut parts = Vec::new();
+    let mut last_end = 0;
+
+    for cap in re.captures_iter(section) {
+        let whole = cap.get(0).unwrap();
+        let before = &section[last_end..whole.start()];
+        if !before.trim().is_empty() {
+            parts.push(SectionPart::Markdown(before.to_string()));
+        }
+        parts.push(SectionPart::MermaidImage {
+            base64_data: cap[1].to_string(),
+        });
+        last_end = whole.end();
+    }
+
+    let after = &section[last_end..];
+    if !after.trim().is_empty() {
+        parts.push(SectionPart::Markdown(after.to_string()));
+    }
+
+    if parts.is_empty() {
+        parts.push(SectionPart::Markdown(section.to_string()));
+    }
+
+    parts
+}
+
+/// Decode a base64-encoded PNG and load (or retrieve from cache) an egui texture.
+fn load_or_cache_texture(
+    ctx: &egui::Context,
+    base64_data: &str,
+    cache: &mut std::collections::HashMap<u64, egui::TextureHandle>,
+) -> egui::TextureHandle {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    base64_data.len().hash(&mut hasher);
+    // Hash first and last 256 bytes for speed (full data is huge)
+    base64_data[..base64_data.len().min(256)].hash(&mut hasher);
+    if base64_data.len() > 256 {
+        base64_data[base64_data.len() - 256..].hash(&mut hasher);
+    }
+    let hash = hasher.finish();
+
+    cache
+        .entry(hash)
+        .or_insert_with(|| {
+            use base64::Engine;
+            let png_bytes = base64::engine::general_purpose::STANDARD
+                .decode(base64_data)
+                .unwrap_or_default();
+            let img = image::load_from_memory(&png_bytes)
+                .unwrap_or_else(|_| image::DynamicImage::new_rgba8(1, 1));
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [w as usize, h as usize],
+                &rgba,
+            );
+            ctx.load_texture(
+                format!("mermaid_{}", hash),
+                color_image,
+                egui::TextureOptions::LINEAR,
+            )
+        })
+        .clone()
+}
+
 struct MdrApp {
     markdown: String,
     sections: Vec<String>,
+    section_parts: Vec<Vec<SectionPart>>,
     has_preamble: bool,
     caches: Vec<CommonMarkCache>,
     file_path: PathBuf,
@@ -113,6 +206,8 @@ struct MdrApp {
     search_query: String,
     search_section_matches: Vec<usize>,
     current_match: usize,
+    texture_cache: std::collections::HashMap<u64, egui::TextureHandle>,
+    popup_texture: Option<egui::TextureHandle>,
 }
 
 impl eframe::App for MdrApp {
@@ -126,13 +221,19 @@ impl eframe::App for MdrApp {
                 self.markdown = resolve_local_image_paths(&self.markdown, &self.base_dir);
                 let (has_preamble, sections) = split_by_headings(&self.markdown);
                 self.has_preamble = has_preamble;
+                self.section_parts = sections.iter().map(|s| split_section_by_mermaid(s)).collect();
                 self.sections = sections;
                 self.caches.clear();
+                self.texture_cache.clear();
             }
         }
 
-        // Ensure we have enough caches
-        while self.caches.len() < self.sections.len() {
+        // Ensure we have enough caches (one per Markdown part across all sections)
+        let total_md_parts: usize = self.section_parts.iter()
+            .flat_map(|parts| parts.iter())
+            .filter(|p| matches!(p, SectionPart::Markdown(_)))
+            .count();
+        while self.caches.len() < total_md_parts {
             self.caches.push(CommonMarkCache::default());
         }
 
@@ -144,10 +245,14 @@ impl eframe::App for MdrApp {
                 self.search_section_matches.clear();
             }
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.search_active {
-            self.search_active = false;
-            self.search_query.clear();
-            self.search_section_matches.clear();
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.popup_texture.is_some() {
+                self.popup_texture = None;
+            } else if self.search_active {
+                self.search_active = false;
+                self.search_query.clear();
+                self.search_section_matches.clear();
+            }
         }
 
         // Search bar panel
@@ -245,7 +350,8 @@ impl eframe::App for MdrApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for (i, section) in self.sections.iter().enumerate() {
+                let mut cache_idx = 0;
+                for (i, parts) in self.section_parts.iter().enumerate() {
                     // Place an invisible anchor widget before the section
                     let response = ui.allocate_response(
                         egui::vec2(0.0, 0.0),
@@ -257,15 +363,90 @@ impl eframe::App for MdrApp {
                         response.scroll_to_me(Some(egui::Align::TOP));
                     }
 
-                    // Render the section
-                    let anchor_id = ui.id().with(format!("section_{}", i));
-                    ui.push_id(anchor_id, |ui| {
-                        CommonMarkViewer::new()
-                            .show(ui, &mut self.caches[i], section);
-                    });
+                    for (j, part) in parts.iter().enumerate() {
+                        match part {
+                            SectionPart::Markdown(ref md) => {
+                                let anchor_id = ui.id().with(format!("section_{}_{}", i, j));
+                                ui.push_id(anchor_id, |ui| {
+                                    CommonMarkViewer::new()
+                                        .show(ui, &mut self.caches[cache_idx], md);
+                                });
+                                cache_idx += 1;
+                            }
+                            SectionPart::MermaidImage { ref base64_data } => {
+                                let texture = load_or_cache_texture(
+                                    ui.ctx(),
+                                    base64_data,
+                                    &mut self.texture_cache,
+                                );
+                                let texture_size = texture.size_vec2();
+                                let max_width = ui.available_width();
+                                let scale = (max_width / texture_size.x).min(1.0);
+                                let display_size = texture_size * scale;
+
+                                let (rect, response) = ui.allocate_exact_size(
+                                    display_size,
+                                    egui::Sense::click(),
+                                );
+                                if ui.is_rect_visible(rect) {
+                                    let uv = egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    );
+                                    ui.painter().image(
+                                        texture.id(),
+                                        rect,
+                                        uv,
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                                if response.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if response.clicked() {
+                                    self.popup_texture = Some(texture);
+                                }
+                            }
+                        }
+                    }
                 }
             });
         });
+
+        // Mermaid diagram popup window
+        let mut close_popup = false;
+        if let Some(ref texture) = self.popup_texture {
+            let mut open = true;
+            egui::Window::new("Mermaid Diagram")
+                .open(&mut open)
+                .resizable(true)
+                .collapsible(false)
+                .default_size([800.0, 600.0])
+                .vscroll(true)
+                .hscroll(true)
+                .show(ctx, |ui| {
+                    let size = texture.size_vec2();
+                    let uv = egui::Rect::from_min_max(
+                        egui::pos2(0.0, 0.0),
+                        egui::pos2(1.0, 1.0),
+                    );
+                    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                    if ui.is_rect_visible(rect) {
+                        ui.painter().image(
+                            texture.id(),
+                            rect,
+                            uv,
+                            egui::Color32::WHITE,
+                        );
+                    }
+                });
+            if !open {
+                close_popup = true;
+            }
+        }
+        if close_popup {
+            self.popup_texture = None;
+        }
 
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
@@ -373,6 +554,61 @@ mod tests {
         assert!(sections[0].contains("Line 1"));
         assert!(sections[0].contains("Line 2"));
         assert!(sections[1].contains("Line 3"));
+    }
+
+    // --- split_section_by_mermaid tests ---
+
+    #[test]
+    fn split_no_mermaid_returns_single_markdown() {
+        let section = "# Title\nSome text\n";
+        let parts = split_section_by_mermaid(section);
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(&parts[0], SectionPart::Markdown(s) if s.contains("Title")));
+    }
+
+    #[test]
+    fn split_mermaid_in_middle() {
+        let section = "Before text\n![mermaid diagram](data:image/png;base64,AAAA)\nAfter text\n";
+        let parts = split_section_by_mermaid(section);
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(&parts[0], SectionPart::Markdown(s) if s.contains("Before")));
+        assert!(matches!(&parts[1], SectionPart::MermaidImage { base64_data } if base64_data == "AAAA"));
+        assert!(matches!(&parts[2], SectionPart::Markdown(s) if s.contains("After")));
+    }
+
+    #[test]
+    fn split_mermaid_only() {
+        let section = "![mermaid diagram](data:image/png;base64,BBBB)\n";
+        let parts = split_section_by_mermaid(section);
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(&parts[0], SectionPart::MermaidImage { base64_data } if base64_data == "BBBB"));
+    }
+
+    #[test]
+    fn split_multiple_mermaids() {
+        let section = "Text1\n![mermaid diagram](data:image/png;base64,AA)\nText2\n![mermaid diagram](data:image/png;base64,BB)\nText3\n";
+        let parts = split_section_by_mermaid(section);
+        assert_eq!(parts.len(), 5);
+        assert!(matches!(&parts[0], SectionPart::Markdown(_)));
+        assert!(matches!(&parts[1], SectionPart::MermaidImage { base64_data } if base64_data == "AA"));
+        assert!(matches!(&parts[2], SectionPart::Markdown(_)));
+        assert!(matches!(&parts[3], SectionPart::MermaidImage { base64_data } if base64_data == "BB"));
+        assert!(matches!(&parts[4], SectionPart::Markdown(_)));
+    }
+
+    #[test]
+    fn split_non_mermaid_image_not_split() {
+        let section = "![screenshot](data:image/png;base64,CCCC)\n";
+        let parts = split_section_by_mermaid(section);
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(&parts[0], SectionPart::Markdown(_)));
+    }
+
+    #[test]
+    fn split_empty_section() {
+        let parts = split_section_by_mermaid("");
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(&parts[0], SectionPart::Markdown(_)));
     }
 }
 
