@@ -33,16 +33,52 @@ pub fn render_mermaid_to_svg(source: &str) -> Result<String, String> {
     let preprocessed = preprocess_mermaid_source(source);
     let preprocessed_clone = preprocessed.clone();
     match std::panic::catch_unwind(|| mermaid_rs_renderer::render(&preprocessed_clone)) {
-        Ok(Ok(svg)) => return Ok(svg),
+        Ok(Ok(svg)) => return Ok(fix_svg_font_family_quotes(&svg)),
         _ => {}
     }
     // Fall back to original source (in case preprocessing made things worse)
     let source = source.to_string();
     match std::panic::catch_unwind(|| mermaid_rs_renderer::render(&source)) {
-        Ok(Ok(svg)) => Ok(svg),
+        Ok(Ok(svg)) => Ok(fix_svg_font_family_quotes(&svg)),
         Ok(Err(e)) => Err(format!("{}", e)),
         Err(_) => Err("mermaid renderer panicked (unsupported diagram syntax)".to_string()),
     }
+}
+
+/// Fix unescaped quotes inside font-family attributes emitted by mermaid-rs-renderer.
+/// e.g. font-family="Inter, "Segoe UI", sans-serif" → font-family="Inter, 'Segoe UI', sans-serif"
+///
+/// The real closing quote of the attribute is the one followed by a space, '>', '/', or EOF.
+/// Any other '"' inside the value is an unescaped inner quote that gets replaced with '\''.
+fn fix_svg_font_family_quotes(svg: &str) -> String {
+    let needle = "font-family=\"";
+    let mut result = String::with_capacity(svg.len());
+    let mut rest = svg;
+
+    while let Some(idx) = rest.find(needle) {
+        result.push_str(&rest[..idx + needle.len()]);
+        rest = &rest[idx + needle.len()..];
+
+        // Find the real closing quote: `"` followed by ` `, `>`, `/`, or EOF
+        let bytes = rest.as_bytes();
+        let mut end = rest.len();
+        for i in 0..bytes.len() {
+            if bytes[i] == b'"' {
+                match bytes.get(i + 1) {
+                    None | Some(b' ' | b'>' | b'/') => {
+                        end = i;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        result.push_str(&rest[..end].replace('"', "'"));
+        rest = &rest[end..];
+    }
+    result.push_str(rest);
+    result
 }
 
 /// Temporarily redirect stderr to /dev/null. Restores on drop.
@@ -354,6 +390,35 @@ mod tests {
             assert!(result.contains("Mermaid error:"));
         }
         // If it somehow renders successfully, that's also fine
+    }
+
+    // --- fix_svg_font_family_quotes tests ---
+
+    #[test]
+    fn fix_font_family_unescaped_quotes() {
+        let bad = r#"<text font-family="Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif" font-size="14">"#;
+        let fixed = fix_svg_font_family_quotes(bad);
+        assert!(!fixed.contains(r#""Segoe UI""#), "should replace inner quotes, got: {}", fixed);
+        assert!(fixed.contains("'Segoe UI'"), "should use single quotes, got: {}", fixed);
+    }
+
+    #[test]
+    fn fix_font_family_no_change_when_clean() {
+        let clean = r#"<text font-family="Inter, sans-serif" font-size="14">"#;
+        assert_eq!(fix_svg_font_family_quotes(clean), clean);
+    }
+
+    #[test]
+    fn render_mermaid_svg_parseable_by_usvg() {
+        let source = "graph LR\n  A-->B";
+        if let Ok(svg) = render_mermaid_to_svg(source) {
+            let mut options = usvg::Options::default();
+            let mut db = usvg::fontdb::Database::new();
+            db.load_system_fonts();
+            options.fontdb = std::sync::Arc::new(db);
+            let result = usvg::Tree::from_str(&svg, &options);
+            assert!(result.is_ok(), "usvg should parse fixed SVG, got: {:?}", result.err());
+        }
     }
 
     // --- egui-specific tests ---

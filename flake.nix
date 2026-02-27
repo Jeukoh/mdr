@@ -21,13 +21,13 @@
           nativeBuildInputs = with pkgs; [
             pkg-config
           ] ++ lib.optionals stdenv.isLinux [
-            wrapGAppsHook
+            wrapGAppsHook3
           ];
 
           buildInputs = with pkgs; lib.optionals stdenv.isLinux [
             gtk3
             webkitgtk_4_1
-            libxdo
+            xdotool
             libGL
           ] ++ lib.optionals stdenv.isDarwin [
             darwin.apple_sdk.frameworks.WebKit
