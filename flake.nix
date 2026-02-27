@@ -37,7 +37,7 @@
 
           meta = with lib; {
             description = "A lightweight Markdown viewer with Mermaid diagram support";
-            homepage = "https://github.com/CleverCloud/mdr";
+            homepage = "https://github.com/Jeukoh/mdr";
             license = licenses.mit;
             maintainers = [];
             mainProgram = "mdr";
